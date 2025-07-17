@@ -321,6 +321,7 @@ func buildHeaders(email string) fhttp.Header {
 		"accept-language":    {"en-US,en;q=0.9"},
 		"content-type":       {"application/json"},
 		"csrf-token":         {"nocheck"},
+		"x-requested-with":   {"XMLHttpRequest"},
 		"origin":             {"https://exchange.gemini.com"},
 		"priority":           {"u=1, i"},
 		"referer":            {fmt.Sprintf("https://exchange.gemini.com/signin/forgot?email=%s", email)},
