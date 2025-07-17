@@ -316,11 +316,13 @@ func loadBlacklist() map[string]struct{} {
 
 func buildHeaders(email string) fhttp.Header {
 	return fhttp.Header{
-		"accept":             {"application/json"},
+		"accept":             {"application/json, text/plain, */*"},
 		"accept-encoding":    {"gzip"},
 		"accept-language":    {"en-US,en;q=0.9"},
 		"content-type":       {"application/json"},
 		"csrf-token":         {"nocheck"},
+		"x-requested-with":   {"XMLHttpRequest"},
+		"x-nextjs-data":      {"1"},
 		"origin":             {"https://exchange.gemini.com"},
 		"priority":           {"u=1, i"},
 		"referer":            {fmt.Sprintf("https://exchange.gemini.com/signin/forgot?email=%s", email)},
@@ -352,6 +354,11 @@ func getCSRF(client tls_client.HttpClient, email string) (string, error) {
 		if err != nil {
 			time.Sleep(500 * time.Millisecond)
 			continue
+		}
+		// debug output to help troubleshoot CSRF retrieval
+		fmt.Printf("getCSRF attempt %d status %d len %d\n", i+1, resp.StatusCode, len(body))
+		if len(body) < 100 {
+			fmt.Println(string(body))
 		}
 		var data map[string]interface{}
 		if err := json.Unmarshal(body, &data); err != nil {
