@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -45,6 +46,20 @@ var (
 
 type NextCaptchaResponse struct {
 	Token string `json:"token"`
+}
+
+func readResponseBody(resp *fhttp.Response) ([]byte, error) {
+	defer resp.Body.Close()
+	var reader io.ReadCloser = resp.Body
+	if strings.EqualFold(resp.Header.Get("Content-Encoding"), "gzip") {
+		gr, err := gzip.NewReader(resp.Body)
+		if err != nil {
+			return nil, err
+		}
+		defer gr.Close()
+		reader = gr
+	}
+	return io.ReadAll(reader)
 }
 
 func getFilePath(title string) string {
@@ -302,7 +317,7 @@ func loadBlacklist() map[string]struct{} {
 func buildHeaders(email string) fhttp.Header {
 	return fhttp.Header{
 		"accept":             {"application/json"},
-		"accept-encoding":    {"gzip, deflate, br, zstd"},
+		"accept-encoding":    {"gzip"},
 		"accept-language":    {"en-US,en;q=0.9"},
 		"content-type":       {"application/json"},
 		"csrf-token":         {"nocheck"},
@@ -333,8 +348,7 @@ func getCSRF(client tls_client.HttpClient, email string) (string, error) {
 			time.Sleep(500 * time.Millisecond)
 			continue
 		}
-		body, err := ioutil.ReadAll(resp.Body)
-		resp.Body.Close()
+		body, err := readResponseBody(resp)
 		if err != nil {
 			time.Sleep(500 * time.Millisecond)
 			continue
@@ -421,7 +435,7 @@ func checkEmail(email string, proxy string, folder string, clientKey string) {
 			"priority":                    {"u=3, i"},
 			"accept-language":             {"en-US,en;q=0.9"},
 			"cache-control":               {"no-cache"},
-			"accept-encoding":             {"gzip, deflate, br"},
+			"accept-encoding":             {"gzip"},
 			"user-agent":                  {"gemini/51557 CFNetwork/3857.100.1 Darwin/25.0.0"},
 			"x-datadog-tags":              {"_dd.p.tid=686fc04000000000"},
 			"x-datadog-origin":            {"rum"},
@@ -434,8 +448,7 @@ func checkEmail(email string, proxy string, folder string, clientKey string) {
 			time.Sleep(1 * time.Second)
 			continue
 		}
-		body1, err := ioutil.ReadAll(resp1.Body)
-		resp1.Body.Close()
+		body1, err := readResponseBody(resp1)
 		if err != nil {
 			lastErr = err
 			time.Sleep(1 * time.Second)
@@ -515,7 +528,7 @@ func checkEmail(email string, proxy string, folder string, clientKey string) {
 			"x-datadog-tags":              {"_dd.p.tid=686fc07300000000"},
 			"accept":                      {"application/json"},
 			"content-type":                {"application/json"},
-			"accept-encoding":             {"gzip, deflate, br"},
+			"accept-encoding":             {"gzip"},
 			"traceparent":                 {"00-686fc07300000000bab78b70bf2cac08-333822a136b29600-01"},
 		}
 
@@ -526,8 +539,7 @@ func checkEmail(email string, proxy string, folder string, clientKey string) {
 			continue
 		}
 
-		body2, err := ioutil.ReadAll(resp2.Body)
-		resp2.Body.Close()
+		body2, err := readResponseBody(resp2)
 		if err != nil {
 			lastErr = err
 			time.Sleep(1 * time.Second)
@@ -645,8 +657,7 @@ func checkEmailCaptchaless(email string, proxy string, folder string) {
 		fmt.Printf("[FAILED] %s | %v\n", email, err)
 		return
 	}
-	respBody, _ := ioutil.ReadAll(resp.Body)
-	resp.Body.Close()
+	respBody, _ := readResponseBody(resp)
 
 	atomic.AddInt32(&checked, 1)
 	cpmMutex.Lock()
